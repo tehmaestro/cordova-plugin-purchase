@@ -81,7 +81,7 @@ SOFTWARE.
         </config-file>
 
         <source-file src="src/android/billing_key_param.xml" target-dir="res/values/" />
-        <config-file target="*/billing_key_param.xml" parent="/*">
+        <config-file target="app/src/main/res/values/billing_key_param.xml" parent="/*">
             <string name="billing_key_param">$BILLING_KEY</string>
         </config-file>
 
