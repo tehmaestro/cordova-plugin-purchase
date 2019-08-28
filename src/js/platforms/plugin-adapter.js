@@ -1,5 +1,5 @@
 (function() {
-"use strict";
+
 
 var initialized = false;
 var skus = [];
@@ -9,7 +9,9 @@ store.when("refreshed", function() {
 });
 
 store.when("re-refreshed", function() {
-    store.iabGetPurchases();
+    store.iabGetPurchases(function() {
+        store.trigger('refresh-completed');
+    });
 });
 
 store.when("load", function() {
@@ -48,6 +50,7 @@ function init() {
                 code: store.ERR_SETUP,
                 message: 'Init failed - ' + err
             });
+            retry(init);
         },
         {
             showLog: store.verbosity >= store.DEBUG ? true : false
@@ -72,6 +75,7 @@ function loadProducts() {
 function iabReady() {
     store.log.debug("plugin -> ready");
     store.inappbilling.getAvailableProducts(iabLoaded, function(err) {
+        retry(iabReady);
         store.error({
             code: store.ERR_LOAD,
             message: 'Loading product info failed - ' + err
@@ -81,23 +85,62 @@ function iabReady() {
 
 function iabLoaded(validProducts) {
     store.log.debug("plugin -> loaded - " + JSON.stringify(validProducts));
-    var p, i;
+    var p, i, vp;
     for (i = 0; i < validProducts.length; ++i) {
+        vp = validProducts[i];
 
-        if (validProducts[i].productId)
-            p = store.products.byId[validProducts[i].productId];
+        if (vp.productId)
+            p = store.products.byId[vp.productId];
         else
             p = null;
 
         if (p) {
+            var subscriptionPeriod = vp.subscriptionPeriod ? vp.subscriptionPeriod : "";
+            var introPriceSubscriptionPeriod = vp.introductoryPricePeriod ? vp.introductoryPricePeriod : "";
+            var introPriceNumberOfPeriods = vp.introductoryPriceCycles ? vp.introductoryPriceCycles : 0;
+
+            var introPricePaymentMode = null;
+            if (vp.freeTrialPeriod) {
+                introPricePaymentMode = 'FreeTrial';
+            }
+            else if (vp.introductoryPrice) {
+                if (vp.introductoryPrice < vp.price && subscriptionPeriod === introPriceSubscriptionPeriod) {
+                    introPricePaymentMode = 'PayAsYouGo';
+                }
+                else if (introPriceNumberOfPeriods === 1) {
+                    introPricePaymentMode = 'UpFront';
+                }
+            }
+
+            var normalizeIntroPricePeriod = function (period) {
+                switch (period.slice(-1)) { // See https://en.wikipedia.org/wiki/ISO_8601#Time_intervals
+                    case 'D': return 'Day';
+                    case 'W': return 'Week';
+                    case 'M': return 'Month';
+                    case 'Y': return 'Year';
+                    default:  return period;
+                }
+            };
+            introPriceSubscriptionPeriod = normalizeIntroPricePeriod(introPriceSubscriptionPeriod);
+
             p.set({
-                title: validProducts[i].title || validProducts[i].name,
-                price: validProducts[i].price || validProducts[i].formattedPrice,
-                priceMicros: validProducts[i].price_amount_micros,
-                description: validProducts[i].description,
-                currency: validProducts[i].price_currency_code ? validProducts[i].price_currency_code : "",
+                title: vp.title || vp.name,
+                price: vp.price || vp.formattedPrice,
+                priceMicros: vp.price_amount_micros,
+                trialPeriod: vp.trial_period || null,
+                trialPeriodUnit: vp.trial_period_unit || null,
+                billingPeriod: vp.billing_period || null,
+                billingPeriodUnit: vp.billing_period_unit || null,
+                description: vp.description,
+                currency: vp.price_currency_code || "",
+                introPrice: vp.introductoryPrice ? vp.introductoryPrice : "",
+                introPriceMicros: vp.introductoryPriceAmountMicros ? vp.introductoryPriceAmountMicros : "",
+                introPriceNumberOfPeriods: introPriceNumberOfPeriods,
+                introPriceSubscriptionPeriod: introPriceSubscriptionPeriod,
+                introPricePaymentMode: introPricePaymentMode,
                 state: store.VALID
             });
+
             p.trigger("loaded");
         }
     }
@@ -109,7 +152,15 @@ function iabLoaded(validProducts) {
         }
     }
 
-    store.iabGetPurchases();
+    store.iabGetPurchases(function() {
+        store.trigger('refresh-completed');
+    });
+
+    if (store.autoRefreshIntervalMillis !== 0) {
+        // Auto-refresh every 24 hours (or autoRefreshIntervalMillis)
+        var interval = store.autoRefreshIntervalMillis || (1000 * 3600 * 24);
+        window.setInterval(store.refresh, interval);
+    }
 }
 
 store.when("requested", function(product) {
@@ -210,5 +261,43 @@ store.when("product", "finished", function(product) {
         product.set('state', store.OWNED);
     }
 });
+
+//
+// ## Retry failed requests
+//
+// When setup and/or load failed, the plugin will retry over and over till it can connect
+// to the store.
+//
+// However, to be nice with the battery, it'll double the retry timeout each time.
+//
+// Special case, when the device goes online, it'll trigger all retry callback in the queue.
+var retryTimeout = 5000;
+var retries = [];
+function retry(fn) {
+
+    var tid = setTimeout(function() {
+        retries = retries.filter(function(o) {
+            return tid !== o.tid;
+        });
+        fn();
+    }, retryTimeout);
+
+    retries.push({ tid: tid, fn: fn });
+
+    retryTimeout *= 2;
+    // Max out the waiting time to 2 minutes.
+    if (retryTimeout > 120000)
+        retryTimeout = 120000;
+}
+
+document.addEventListener("online", function() {
+    var a = retries;
+    retries = [];
+    retryTimeout = 5000;
+    for (var i = 0; i < a.length; ++i) {
+        clearTimeout(a[i].tid);
+        a[i].fn.call(this);
+    }
+}, false);
 
 })();
